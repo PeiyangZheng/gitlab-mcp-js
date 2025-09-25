@@ -17,6 +17,7 @@
   },
   "scripts": {
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
+    "start": "node build/index.js",
     "prepare": "npm run build",
     "dev": "npm run build && node build/index.js",
     "watch": "tsc --watch",
