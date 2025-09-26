@@ -1,2 +1,2 @@
 # external/gitlab-mcp/Procfile
-web: node build/index.js
+web: npm run start
