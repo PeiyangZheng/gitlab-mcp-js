@@ -5536,6 +5536,27 @@ async function startSSEServer(): Promise<void> {
     });
   });
 
+  // Backward compatible liveness endpoint alias
+  app.get("/live", (_: Request, res: Response) => {
+    res.status(200).json({ status: "ok", type: "liveness", transport: TransportMode.SSE });
+  });
+
+  // Readiness endpoint (can be expanded with real dependency checks)
+  app.get("/ready", async (_: Request, res: Response) => {
+    // Placeholder checks - extend with external dependencies when needed
+    const checks: Record<string, { ok: boolean; detail?: string }> = {};
+    checks["process"] = { ok: true };
+    const allOk = Object.values(checks).every(c => c.ok);
+    const payload = {
+      status: allOk ? "ok" : "degraded",
+      type: "readiness",
+      transport: TransportMode.SSE,
+      checks,
+      ts: new Date().toISOString(),
+    };
+    res.status(allOk ? 200 : 503).json(payload);
+  });
+
   app.listen(Number(PORT), HOST, () => {
     logger.info(`GitLab MCP Server running with SSE transport`);
     const colorGreen = "\x1b[32m";
@@ -5633,6 +5654,24 @@ async function startStreamableHTTPServer(): Promise<void> {
       transport: TransportMode.STREAMABLE_HTTP,
       activeSessions: Object.keys(streamableTransports).length,
     });
+  });
+
+  app.get("/live", (_: Request, res: Response) => {
+    res.status(200).json({ status: "ok", type: "liveness", transport: TransportMode.STREAMABLE_HTTP });
+  });
+
+  app.get("/ready", async (_: Request, res: Response) => {
+    const checks: Record<string, { ok: boolean; detail?: string }> = {};
+    checks["sessions"] = { ok: true, detail: `${Object.keys(streamableTransports).length} active` };
+    const allOk = Object.values(checks).every(c => c.ok);
+    const payload = {
+      status: allOk ? "ok" : "degraded",
+      type: "readiness",
+      transport: TransportMode.STREAMABLE_HTTP,
+      checks,
+      ts: new Date().toISOString(),
+    };
+    res.status(allOk ? 200 : 503).json(payload);
   });
 
   // Start server
