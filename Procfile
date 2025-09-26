@@ -1,2 +1,3 @@
 # external/gitlab-mcp/Procfile
-web: npm run start
+web: concurrently "node build/index.js" "node health.js"
+
