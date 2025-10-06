@@ -5570,47 +5570,34 @@ async function startSSEServer(): Promise<void> {
  */
 async function startStreamableHTTPServer(): Promise<void> {
   const app = express();
-  const streamableTransports: {
-    [sessionId: string]: StreamableHTTPServerTransport;
-  } = {};
+  // Stateless mode: do NOT keep a map of sessionId -> transport.
+  // Each request creates and disposes its own transport.
 
   // Configure Express middleware
   app.use(express.json());
 
   // Streamable HTTP endpoint - handles both session creation and message handling
   app.post("/mcp", async (req: Request, res: Response) => {
-    const sessionId = req.headers["mcp-session-id"] as string;
-
     try {
-      let transport: StreamableHTTPServerTransport;
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (ephemeralId: string) => {
+          logger.debug(`Stateless ephemeral session created: ${ephemeralId}`);
+        },
+      });
 
-      if (sessionId && streamableTransports[sessionId]) {
-        // Reuse existing transport for ongoing session
-        transport = streamableTransports[sessionId];
-        await transport.handleRequest(req, res, req.body);
-      } else {
-        // Create new transport for new session
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId: string) => {
-            streamableTransports[newSessionId] = transport;
-            logger.warn(`Streamable HTTP session initialized: ${newSessionId}`);
-          },
-        });
+      // Best-effort cleanup after response completed
+      transport.onclose = () => {
+        logger.debug("Ephemeral transport closed");
+      };
 
-        // Set up cleanup handler when transport closes
-        transport.onclose = () => {
-          const sid = transport.sessionId;
-          if (sid && streamableTransports[sid]) {
-            logger.warn(`Streamable HTTP transport closed for session ${sid}, cleaning up`);
-            delete streamableTransports[sid];
-          }
-        };
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
 
-        // Connect transport to MCP server before handling the request
-        await server.connect(transport);
-        await transport.handleRequest(req, res, req.body);
-      }
+      // Add header to indicate stateless behavior
+      try { res.setHeader('x-mcp-mode', 'stateless'); } catch { /* ignore */ }
+      // Close transport proactively (ignore errors)
+      try { await transport.close(); } catch { /* ignore */ }
     } catch (error) {
       logger.error("Streamable HTTP error:", error);
       res.status(500).json({
@@ -5621,28 +5608,9 @@ async function startStreamableHTTPServer(): Promise<void> {
   });
 
   // to delete a mcp server session explicitly
-  app.delete("/mcp", async (req: Request, res: Response) => {
-    const sessionId = req.headers["mcp-session-id"] as string;
-
-    if (!sessionId) {
-      res.status(400).json({ error: "mcp-session-id header is required" });
-      return;
-    }
-
-    const transport = streamableTransports[sessionId];
-
-    if (transport) {
-      try {
-        await transport.close();
-        logger.info(`Explicitly closed session via DELETE request: ${sessionId}`);
-        res.status(204).send();
-      } catch (error) {
-        logger.error(`Error closing session ${sessionId}:`, error);
-        res.status(500).json({ error: "Failed to close session" });
-      }
-    } else {
-      res.status(404).json({ error: "Session not found" });
-    }
+  app.delete("/mcp", async (_: Request, res: Response) => {
+    // Stateless: nothing to delete
+    res.status(204).send();
   });
 
 
@@ -5652,7 +5620,8 @@ async function startStreamableHTTPServer(): Promise<void> {
       status: "healthy",
       version: SERVER_VERSION,
       transport: TransportMode.STREAMABLE_HTTP,
-      activeSessions: Object.keys(streamableTransports).length,
+      stateless: true,
+      activeSessions: 0,
     });
   });
 
@@ -5662,7 +5631,7 @@ async function startStreamableHTTPServer(): Promise<void> {
 
   app.get("/ready", async (_: Request, res: Response) => {
     const checks: Record<string, { ok: boolean; detail?: string }> = {};
-    checks["sessions"] = { ok: true, detail: `${Object.keys(streamableTransports).length} active` };
+    checks["sessions"] = { ok: true, detail: "stateless" };
     const allOk = Object.values(checks).every(c => c.ok);
     const payload = {
       status: allOk ? "ok" : "degraded",
