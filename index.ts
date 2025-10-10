@@ -5566,93 +5566,60 @@ async function startSSEServer(): Promise<void> {
 }
 
 /**
- * Start server with Streamable HTTP transport
+ * Start server with Streamable HTTP transport (STATeless)
  */
 async function startStreamableHTTPServer(): Promise<void> {
   const app = express();
-  const streamableTransports: {
-    [sessionId: string]: StreamableHTTPServerTransport;
-  } = {};
 
-  // Configure Express middleware
+  // 1) 中间件
   app.use(express.json());
 
-  // Streamable HTTP endpoint - handles both session creation and message handling
+  // 2) 纯无状态的 MCP 端点：只支持 POST
   app.post("/mcp", async (req: Request, res: Response) => {
-    const sessionId = req.headers["mcp-session-id"] as string;
-
     try {
-      let transport: StreamableHTTPServerTransport;
-
-      if (sessionId && streamableTransports[sessionId]) {
-        // Reuse existing transport for ongoing session
-        transport = streamableTransports[sessionId];
-        await transport.handleRequest(req, res, req.body);
-      } else {
-        // Create new transport for new session
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId: string) => {
-            streamableTransports[newSessionId] = transport;
-            logger.warn(`Streamable HTTP session initialized: ${newSessionId}`);
-          },
-        });
-
-        // Set up cleanup handler when transport closes
-        transport.onclose = () => {
-          const sid = transport.sessionId;
-          if (sid && streamableTransports[sid]) {
-            logger.warn(`Streamable HTTP transport closed for session ${sid}, cleaning up`);
-            delete streamableTransports[sid];
-          }
-        };
-
-        // Connect transport to MCP server before handling the request
-        await server.connect(transport);
-        await transport.handleRequest(req, res, req.body);
-      }
-    } catch (error) {
-      logger.error("Streamable HTTP error:", error);
-      res.status(500).json({
-        error: "Internal server error",
-        message: error instanceof Error ? error.message : "Unknown error",
+      // 如果你的 McpServer 无跨请求状态，这里可以复用单例；
+      // 为了彻底无副作用，也可以每次创建新的 server 实例：
+      // const server = makeNewMcpServer()
+      // 下面示例假设你已有一个上层构建好的 `server` 单例：
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined, // 关键：禁用会话/不产生 sessionId
       });
-    }
-  });
 
-  // to delete a mcp server session explicitly
-  app.delete("/mcp", async (req: Request, res: Response) => {
-    const sessionId = req.headers["mcp-session-id"] as string;
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
 
-    if (!sessionId) {
-      res.status(400).json({ error: "mcp-session-id header is required" });
-      return;
-    }
-
-    const transport = streamableTransports[sessionId];
-
-    if (transport) {
-      try {
-        await transport.close();
-        logger.info(`Explicitly closed session via DELETE request: ${sessionId}`);
-        res.status(204).send();
-      } catch (error) {
-        logger.error(`Error closing session ${sessionId}:`, error);
-        res.status(500).json({ error: "Failed to close session" });
+      // 用完即关（释放资源）
+      res.on("close", () => {
+        transport.close().catch(() => void 0);
+        // 如果 server 是“按请求创建”的，这里也一起 server.close().catch(() => void 0)
+      });
+    } catch (error) {
+      logger.error("Streamable HTTP error (stateless):", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "Internal server error",
+          message: error instanceof Error ? error.message : "Unknown error",
+        });
       }
-    } else {
-      res.status(404).json({ error: "Session not found" });
     }
   });
 
+  // 3) 禁用 GET/DELETE /mcp（按规范返回 405）
+  app.get("/mcp", (_: Request, res: Response) => {
+    res.status(405).json({ error: "Method not allowed (stateless)" });
+  });
 
-  // Health check endpoint
+  app.delete("/mcp", (_: Request, res: Response) => {
+    res.status(405).json({ error: "Method not allowed (stateless)" });
+  });
+
+  // 4) 健康检查
   app.get("/health", (_: Request, res: Response) => {
     res.status(200).json({
       status: "healthy",
       version: SERVER_VERSION,
       transport: TransportMode.STREAMABLE_HTTP,
-      activeSessions: Object.keys(streamableTransports).length,
+      // activeSessions: 0, // 可选：保留该字段但固定为 0
     });
   });
 
@@ -5662,24 +5629,25 @@ async function startStreamableHTTPServer(): Promise<void> {
 
   app.get("/ready", async (_: Request, res: Response) => {
     const checks: Record<string, { ok: boolean; detail?: string }> = {};
-    checks["sessions"] = { ok: true, detail: `${Object.keys(streamableTransports).length} active` };
+    // 在无状态模式下，不检查 session；可以加入你实际依赖的外部服务自检
+    checks["app"] = { ok: true, detail: "stateless mode" };
     const allOk = Object.values(checks).every(c => c.ok);
-    const payload = {
+    res.status(allOk ? 200 : 503).json({
       status: allOk ? "ok" : "degraded",
       type: "readiness",
       transport: TransportMode.STREAMABLE_HTTP,
       checks,
       ts: new Date().toISOString(),
-    };
-    res.status(allOk ? 200 : 503).json(payload);
+    });
   });
 
-  // Start server
+  // 5) 启动
   app.listen(Number(PORT), HOST, () => {
-    logger.info(`GitLab MCP Server running with Streamable HTTP transport`);
+    logger.info(`GitLab MCP Server running in **STATeless** Streamable HTTP mode`);
     logger.info(`${colorGreen}Endpoint: http://${HOST}:${PORT}/mcp${colorReset}`);
   });
 }
+
 
 /**
  * Initialize server with specific transport mode
